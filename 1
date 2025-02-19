@@ -1,0 +1,253 @@
+Below is a step-by-step guide with example configuration files to achieve the following goals:
+
+Collect all Windows Event logs from Windows2 and Windows3 (both Windows 11).
+Send these logs to a Logstash instance on Windows-LOGSTASH and store them locally in a rolling/rotating file (up to 20GB).
+Use Filebeat on Windows-LOGSTASH to forward the locally stored logs to the Wazuh stack on linux-WAZUH (Ubuntu 24.04) for indexing and visualization.
+Ensure resilience so that if Windows-LOGSTASH is disconnected from linux-WAZUH, logs will be cached locally and forwarded once connectivity is restored.
+Distinguish logs from Windows2 and Windows3 in Wazuh.
+Do not install the Wazuh agent on Windows2 and Windows3 (use Winlogbeat or another forwarder instead).
+Overall Architecture
+pgsql
+Copy
++-------------------+      +--------------------+      +---------------------+
+|  Windows2 (Win11) |      |                    |      |  linux-WAZUH (Ubuntu|
+|  - Winlogbeat     | ---> |  Windows-LOGSTASH  | ---> | 24.04)              |
+|  - Forwards logs  |      |  - Logstash        |      | - Wazuh indexer     |
+|                   |      |  - Rolling local   |      | - Wazuh server      |
++-------------------+      |    storage (20GB)  |      | - Wazuh dashboard   |
+                           |  - Filebeat -->    |      +---------------------+
++-------------------+      |    forward to      |
+|  Windows3 (Win11) |      |    Wazuh           |
+|  - Winlogbeat     | ---> +--------------------+
+|  - Forwards logs  |
++-------------------+
+Windows2 & Windows3 each run Winlogbeat, sending logs to Windows-LOGSTASH on port 5044.
+Windows-LOGSTASH uses Logstash to receive logs, store them in a rolling file (max 20GB), and also runs Filebeat to ship those logs to the Wazuh cluster on linux-WAZUH.
+If the network link between Windows-LOGSTASH and linux-WAZUH goes down, Filebeat on Windows-LOGSTASH will queue/hold logs until connectivity is restored.
+No Wazuh agent is deployed on the Windows endpoints.
+1. Install and Configure Winlogbeat on Windows2 and Windows3
+Use the official Winlogbeat (from Elastic) on each Windows machine. Below is an example Winlogbeat configuration for Windows2. The same applies to Windows3 with slight modifications (especially the name or additional fields).
+
+1.1 Download and Install Winlogbeat
+Download Winlogbeat (matching your Logstash/Filebeat/Elasticsearch major version, e.g., 7.x or 8.x) from Elastic’s downloads page.
+Extract/unzip and place it in a suitable directory (e.g., C:\Program Files\Winlogbeat).
+1.2 Example winlogbeat.yml for Windows2
+yaml
+Copy
+# winlogbeat.yml
+
+winlogbeat.event_logs:
+  - name: Application
+  - name: System
+  - name: Security
+
+# You can add other channels if needed.
+# e.g.:
+#  - name: Microsoft-Windows-PowerShell/Operational
+#  - name: ...
+
+# Configure output to Logstash
+output.logstash:
+  hosts: ["WINDOWS-LOGSTASH:5044"]  
+  # If you have DNS issues, you can use IP, e.g. ["192.168.1.10:5044"]
+
+# (Optional) Include some metadata to distinguish logs
+name: "Windows2"
+fields:
+  os: "Windows11"
+  source_host: "Windows2"
+
+fields_under_root: true
+
+# Set logging level (optional)
+logging.level: info
+logging.to_files: true
+logging.files:
+  path: C:/ProgramData/winlogbeat/logs
+Notes:
+Change WINDOWS-LOGSTASH to the actual hostname (or IP) of your Logstash server.
+For Windows3, simply change name: "Windows3" and source_host: "Windows3".
+1.3 Install Winlogbeat as a Service
+Open PowerShell or Command Prompt (as Administrator), navigate to the Winlogbeat directory, and run:
+
+powershell
+Copy
+winlogbeat.exe install
+winlogbeat.exe start
+This installs Winlogbeat as a Windows service and starts it automatically.
+
+2. Configure Logstash on Windows-LOGSTASH
+Logstash needs to listen for incoming beats (Winlogbeat) on port 5044, store logs locally in a rotating file up to 20GB, and also make them available for Filebeat to pick up.
+
+2.1 Install Logstash
+Download and install the same major version of Logstash from Elastic’s downloads page.
+Once installed, locate your Logstash configuration directory (commonly C:\logstash\config or C:\Program Files\Logstash\config).
+2.2 Add the Rolled File Plugin (if needed)
+By default, the built-in file output in Logstash does not rotate by size. You have a few options to achieve a “cyclic” max-size approach:
+
+Use an external solution (e.g., [logrotate via scheduled tasks]) to rotate the file once it hits 20GB.
+Use a community or third-party plugin like logstash-output-rolled_file.
+Below is an example using the rolled_file plugin:
+
+powershell
+Copy
+# From PowerShell, install the plugin if needed:
+logstash-plugin install logstash-output-rolled_file
+2.3 Create Logstash Pipeline Configuration
+Create a file, e.g. C:\logstash\config\pipelines\winbeats.conf:
+
+conf
+Copy
+# winbeats.conf
+
+input {
+  beats {
+    port => 5044
+    # If using SSL, configure ssl_certificate/ssl_key here
+  }
+}
+
+filter {
+  # Optional filters if you want to parse or manipulate fields
+  # Example: add tags or rename fields
+  mutate {
+    add_tag => ["from_winlogbeat"]
+  }
+}
+
+output {
+  # 1) Output to a rolling file up to ~20GB
+  rolled_file {
+    path => "C:/logstash-data/logstash-output"
+    # The actual filename pattern
+    filename_pattern => "logstash-%{+yyyyMMdd_HH}.log" 
+    # This is the size limit in bytes (20GB)
+    file_size_limit => 21474836480
+    # The number of rotated files to keep before overwriting the oldest
+    # If you only want a single file up to 20GB, then set:
+    max_roll_count => 1
+    # If you allow more than 1, you can keep multiple older files
+    # e.g. max_roll_count => 5
+    # Then you get up to 5 x 20GB = 100GB max
+  }
+
+  # 2) (Optional) If you want to do something else with logs
+  #    or debug them before Filebeat picks them up, you can
+  #    add more outputs here.
+}
+Important: The above configuration means Logstash will continuously append to a file named with a pattern like logstash-20250219_15.log until it reaches 20GB, then roll it. If max_roll_count => 1, it will overwrite the old file once the new file also hits 20GB. This effectively caps your storage usage.
+
+You must ensure that the directory C:/logstash-data exists (or whichever path you use) and that Logstash has permission to write there.
+
+2.4 Run Logstash
+To run Logstash (PowerShell, as admin):
+
+powershell
+Copy
+cd "C:\Program Files\Logstash\bin"
+.\logstash.bat -f "C:\logstash\config\pipelines\winbeats.conf"
+Or set it up as a Windows service, depending on your preference.
+
+3. Configure Filebeat on Windows-LOGSTASH to Forward to Wazuh
+Next, Filebeat will read the rolled/rotating log files created by Logstash and forward them to your Wazuh cluster on linux-WAZUH. Because we want resilience, Filebeat will keep track of what has already been sent. If the link to Wazuh is lost, Filebeat will buffer and catch up when the connection is back.
+
+3.1 Install Filebeat
+On Windows-LOGSTASH, install Filebeat similarly (matching the major version of your Wazuh/Elastic components).
+
+3.2 Example filebeat.yml
+Create or modify C:\Program Files\Filebeat\filebeat.yml:
+
+yaml
+Copy
+filebeat.inputs:
+  - type: log
+    enabled: true
+    # Point to the rolling files from Logstash
+    paths:
+      - "C:/logstash-data/*.log"
+    # If logs can have multiline messages, you might configure multiline here
+    # multiline:
+    #   pattern: '^\['
+    #   negate: true
+    #   match: after
+
+    # Additional fields to help identify
+    fields:
+      source: "logstash-rolled"
+      environment: "production"
+    fields_under_root: true
+
+# Output to Wazuh/Elasticsearch
+output.elasticsearch:
+  # Replace with the actual IP or domain of your Wazuh cluster’s Elasticsearch
+  # Typically, if Wazuh is using an embedded Elasticsearch, it might be
+  # accessible via port 9200 on the same server or a load balancer.
+  hosts: ["linux-WAZUH:9200"]
+  # If needed, specify username/password or certificates
+
+  # This ensures Filebeat keeps data until it can deliver them
+  # (default is usually 10-15 seconds)
+  bulk_max_size: 50
+  worker: 1
+
+# Enable/adjust logging if desired
+logging.level: info
+logging.to_files: true
+logging.files:
+  path: C:/ProgramData/filebeat/logs
+Notes:
+If your Wazuh cluster does not run on port 9200, adjust accordingly.
+If you have TLS enabled on Wazuh, you must configure the SSL settings here (e.g., ssl.certificate_authorities).
+If you have a separate index or pipeline for Wazuh, you may need to specify them (e.g., setup.template.name, setup.template.pattern, index, etc.).
+3.3 Start Filebeat
+As with Winlogbeat:
+
+powershell
+Copy
+filebeat.exe install
+filebeat.exe start
+This will launch Filebeat as a service, tail the rolling log files from Logstash, and forward them to linux-WAZUH.
+
+4. Verify in Wazuh
+On linux-WAZUH, access your Wazuh Dashboard (Kibana, or the dedicated Wazuh UI).
+You should see incoming logs from the Windows machines.
+The logs should contain fields like host.name (from Winlogbeat) or the custom fields you added, allowing you to distinguish Windows2 vs. Windows3.
+If the link from Windows-LOGSTASH to linux-WAZUH goes down, check the Filebeat logs on Windows-LOGSTASH to confirm it is retrying. Once connectivity is restored, logs are forwarded automatically.
+5. Resilience and Catch-Up
+Winlogbeat on Windows2/Windows3 will automatically queue logs briefly if it can’t reach Windows-LOGSTASH. Once connectivity is restored, logs continue.
+Logstash writes all logs to local rolling files up to 20GB. You’ll have a local repository of logs on Windows-LOGSTASH.
+Filebeat on Windows-LOGSTASH will read from those files and keep an internal registry of what has been sent to Wazuh. If the link to Wazuh is down, logs remain in local files. Once Wazuh is reachable again, Filebeat continues reading from where it left off.
+Because of the 20GB rolling limit, older logs will be overwritten after you hit the file size limit (depending on how quickly you generate logs). This satisfies your “cyclic log” requirement. If you want a different approach (like time-based rotation plus size-based retention), you can tune the plugin or use an external tool (logrotate for Windows, or custom scripts).
+
+6. Distinguishing Windows2 and Windows3 in Wazuh
+You have several ways to differentiate logs:
+
+Via Winlogbeat name:
+yaml
+Copy
+name: "Windows2"
+fields:
+  source_host: "Windows2"
+  os: "Windows11"
+By default, Winlogbeat also sends the hostname in host.name or agent.name.
+Logstash can also add or mutate fields/tags, but typically you don’t need to if Winlogbeat is already sending them.
+Filebeat can add further fields or tags in its input config.
+When you view these logs in the Wazuh/Kibana interface, you can filter by host.name: Windows2 or whichever fields you set.
+
+7. Summary of Key Files
+Windows2 / Windows3: C:\Program Files\Winlogbeat\winlogbeat.yml
+Windows-LOGSTASH:
+Logstash pipeline: C:\logstash\config\pipelines\winbeats.conf
+Logstash rolled file output stored in: C:\logstash-data\ (or your chosen path)
+Filebeat config: C:\Program Files\Filebeat\filebeat.yml
+8. Tips and Considerations
+Firewall: Ensure port 5044 is open on Windows-LOGSTASH for inbound from Windows2/Windows3. Ensure any relevant ports (e.g., 9200) are open from Windows-LOGSTASH to linux-WAZUH.
+SSL/TLS: In production, it is strongly recommended to encrypt traffic (using SSL certificates) especially from Winlogbeat to Logstash and from Filebeat to Wazuh.
+Monitoring: Keep an eye on disk usage on Windows-LOGSTASH to make sure you aren’t inadvertently running out of space, especially if logs come in fast and you have large bursts.
+Index Management in Wazuh: You may want to create specific indices or index patterns for Windows logs in Wazuh. Alternatively, you can rely on the default index.
+Complete End-to-End Flow
+Winlogbeat (Windows2, Windows3) → port 5044 → Logstash (Windows-LOGSTASH).
+Logstash writes logs to rolling files up to 20GB.
+Filebeat monitors those rolling files → sends to Wazuh (linux-WAZUH).
+Wazuh/Elasticsearch indexes the logs, Wazuh Dashboard visualizes them.
+You now have a reliable pipeline with local caching/rolling, no Wazuh agent on the Windows endpoints, and clear distinction between Windows2 and Windows3 logs in Wazuh.
